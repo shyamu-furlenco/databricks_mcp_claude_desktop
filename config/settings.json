@@ -1,0 +1,20 @@
+{
+  "databricks": {
+    "host": "dbc-c35c1c4c-58ed.cloud.databricks.com",
+    "token": "",
+    "http_path": "/sql/1.0/warehouses/19afafffa353216f"
+  },
+  "guardrails": {
+    "allowed_catalogs": [],
+    "allowed_schemas": [],
+    "allowed_job_ids": [],
+    "max_rows": 1000,
+    "silver_max_rows": 10000,
+    "query_timeout_sec": 30,
+    "max_result_bytes": 2000000,
+    "max_concurrent_queries": 3,
+    "result_cache_ttl_sec": 3600,
+    "block_bronze": true,
+    "block_select_star": true
+  }
+}

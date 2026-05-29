@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "databricks-mcp"
+version = "0.1.0"
+description = "Databricks MCP Server with guardrails"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.0.0",
+  "databricks-sql-connector>=3.0.0",
+  "databricks-sdk>=0.20.0",
+]
+
+[project.scripts]
+databricks-mcp = "src.server:run"
