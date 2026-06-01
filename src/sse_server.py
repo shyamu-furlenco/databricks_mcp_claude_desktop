@@ -33,8 +33,21 @@ from starlette.types import Receive, Scope, Send
 import uvicorn
 
 from .server import app as mcp_app, _token_var
+from . import server as _server_module
 
 log = logging.getLogger("databricks-mcp")
+
+# ── Remote-mode safety: disable global token fallback ─────────────────────────
+# In SSE/remote mode every user MUST supply their own Databricks PAT via OAuth.
+# If DATABRICKS_TOKEN is set on the server it would silently share one identity
+# across all users, bypassing per-user auth entirely.
+if _server_module.DATABRICKS_TOKEN:
+    log.critical(
+        "DATABRICKS_TOKEN env var is set on this server — this shares ONE Databricks "
+        "identity with ALL users and defeats per-user auth. "
+        "Go to Render → Environment and DELETE the DATABRICKS_TOKEN variable, then redeploy."
+    )
+_server_module.DATABRICKS_TOKEN = ""  # forcibly clear; each user must authenticate via OAuth
 
 # ── Transport setup ────────────────────────────────────────────────────────────
 
