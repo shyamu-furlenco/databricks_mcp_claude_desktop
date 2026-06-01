@@ -2,7 +2,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY . .
 RUN pip install --no-cache-dir \
-    "mcp>=1.0.0" \
+    "mcp>=1.2.0" \
     "databricks-sql-connector>=3.0.0" \
     "databricks-sdk>=0.20.0" \
     starlette \
