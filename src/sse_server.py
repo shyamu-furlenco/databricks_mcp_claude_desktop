@@ -47,10 +47,6 @@ async def handle_sse(request: Request):
     log.info("SSE connection closed")
 
 
-async def handle_messages(request: Request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
-
-
 # ── Health check ───────────────────────────────────────────────────────────────
 async def health(request: Request):
     return JSONResponse({"status": "ok", "server": "databricks-mcp"})
@@ -59,9 +55,9 @@ async def health(request: Request):
 # ── Starlette app ──────────────────────────────────────────────────────────────
 app = Starlette(
     routes=[
-        Route("/health",     health),
-        Route("/sse",        handle_sse),
-        Mount("/messages/",  routes=[Route("/{path:path}", handle_messages, methods=["POST"])]),
+        Route("/health", health),
+        Route("/sse",    handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
     ],
 )
 
