@@ -46,7 +46,8 @@ except ImportError:
     _HAS_STREAMABLE = False
     log.warning("mcp.server.streamable_http not available — only legacy SSE supported")
 
-# Session store for new Streamable HTTP transport: {session_id: transport}
+# Session store for new Streamable HTTP transport
+# {session_id: {"transport": ..., "ready": asyncio.Event}}
 _http_sessions: dict = {}
 
 # ── OAuth helpers ──────────────────────────────────────────────────────────────
@@ -214,30 +215,38 @@ async def _handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
         session_id = request.headers.get("mcp-session-id")
 
         if session_id and session_id in _http_sessions:
-            transport = _http_sessions[session_id]
+            entry = _http_sessions[session_id]
+            transport = entry["transport"]
             log.info(f"Reusing session {session_id[:8]}...")
+            # Session already running — handle request directly
+            await transport.handle_request(scope, receive, send)
         else:
             transport = StreamableHTTPServerTransport(
                 mcp_session_id=secrets.token_hex(16),
                 is_json_response_enabled=False,
             )
             new_sid = transport.mcp_session_id
-            _http_sessions[new_sid] = transport
+            ready = asyncio.Event()
+            _http_sessions[new_sid] = {"transport": transport, "ready": ready}
             log.info(f"New session {new_sid[:8]}...")
 
             async def _run_server():
                 try:
                     async with transport.connect() as (read, write):
+                        ready.set()  # signal: connect() is done, handle_request() can proceed
                         await mcp_app.run(read, write, mcp_app.create_initialization_options())
                 except Exception as e:
                     log.error(f"MCP session error: {e}", exc_info=True)
                 finally:
+                    ready.set()  # unblock handle_request() even on error
                     _http_sessions.pop(new_sid, None)
                     log.info(f"Session {new_sid[:8]} ended")
 
             asyncio.create_task(_run_server())
 
-        await transport.handle_request(scope, receive, send)
+            # Wait until connect() has set up the streams before handling the request
+            await ready.wait()
+            await transport.handle_request(scope, receive, send)
 
     else:
         # Legacy GET SSE transport
