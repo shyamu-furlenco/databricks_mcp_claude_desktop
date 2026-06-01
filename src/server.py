@@ -53,6 +53,13 @@ RESULT_CACHE_TTL_SEC   = int(GUARDRAILS.get("result_cache_ttl_sec",   3600))
 BLOCK_BRONZE           = bool(GUARDRAILS.get("block_bronze",           True))
 BLOCK_SELECT_STAR      = bool(GUARDRAILS.get("block_select_star",      True))
 
+# ── SQL identifier quoting ────────────────────────────────────────────────────
+
+def _quote_id(name: str) -> str:
+    """Backtick-quote a SQL identifier, stripping embedded backticks to prevent escape."""
+    return f"`{name.replace('`', '')}`"
+
+
 # ── Guardrail patterns ────────────────────────────────────────────────────────
 _WRITE_PATTERN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|CREATE|ALTER|MERGE|REPLACE|GRANT|REVOKE|COPY)\b",
@@ -295,7 +302,7 @@ async def tool_browse_catalog(args: dict) -> list[types.TextContent]:
                 elif level == "schemas":
                     if not catalog:
                         raise ValueError("'catalog' required for level=schemas")
-                    cur.execute(f"SHOW SCHEMAS IN {catalog}")
+                    cur.execute(f"SHOW SCHEMAS IN {_quote_id(catalog)}")
                     result = [r[0] for r in cur.fetchall()]
                     if BLOCK_BRONZE:
                         result = [s for s in result if not re.match(r"^bronze", s, re.IGNORECASE)]
@@ -304,13 +311,13 @@ async def tool_browse_catalog(args: dict) -> list[types.TextContent]:
                 elif level == "tables":
                     if not catalog or not schema:
                         raise ValueError("'catalog' and 'schema' required for level=tables")
-                    cur.execute(f"SHOW TABLES IN {catalog}.{schema}")
+                    cur.execute(f"SHOW TABLES IN {_quote_id(catalog)}.{_quote_id(schema)}")
                     # SHOW TABLES returns: (namespace, tableName, isTemporary)
                     result = [{"table": r[1], "is_temporary": r[2]} for r in cur.fetchall()]
                 elif level == "columns":
                     if not catalog or not schema or not table:
                         raise ValueError("'catalog', 'schema', 'table' required for level=columns")
-                    cur.execute(f"DESCRIBE {catalog}.{schema}.{table}")
+                    cur.execute(f"DESCRIBE {_quote_id(catalog)}.{_quote_id(schema)}.{_quote_id(table)}")
                     result = [{"col_name": r[0], "data_type": r[1], "comment": r[2]} for r in cur.fetchall()]
                 else:
                     raise ValueError(f"Unknown level '{level}'. Use: catalogs|schemas|tables|columns")
@@ -352,10 +359,11 @@ async def tool_read_table(args: dict) -> list[types.TextContent]:
     enforce_catalog_whitelist(catalog)
     enforce_schema_whitelist(schema)
 
-    col_expr = ", ".join(c.strip() for c in columns.split(","))
-    query = f"SELECT {col_expr} FROM {catalog}.{schema}.{table}"
+    col_expr = ", ".join(_quote_id(c.strip()) for c in columns.split(","))
+    query = f"SELECT {col_expr} FROM {_quote_id(catalog)}.{_quote_id(schema)}.{_quote_id(table)}"
     if filters:
         enforce_read_only(filters)
+        enforce_no_bronze(filters)
         query += f" WHERE {filters}"
     query = inject_limit(query, MAX_ROWS)
 

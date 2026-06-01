@@ -17,12 +17,13 @@ OAuth flow (required by Claude.ai for remote connectors):
 
 import asyncio
 import base64
+import collections
 import hashlib
 import logging
 import secrets
 import time
 from html import escape
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from mcp.server.sse import SseServerTransport
 from starlette.requests import Request
@@ -76,6 +77,46 @@ def _extract_token(scope: Scope) -> str:
     return token
 
 
+# ── Rate limiting (per IP, in-memory) ─────────────────────────────────────────
+
+_rl_buckets: dict[str, list[float]] = collections.defaultdict(list)
+_RL_WINDOW_SEC = 60
+_RL_MAX = 20
+
+
+def _client_ip(scope: Scope) -> str:
+    headers = dict(scope.get("headers", []))
+    xff = headers.get(b"x-forwarded-for", b"").decode()
+    if xff:
+        return xff.split(",")[0].strip()
+    client = scope.get("client")
+    return client[0] if client else "unknown"
+
+
+def _rate_ok(ip: str, limit: int = _RL_MAX) -> bool:
+    now = time.time()
+    _rl_buckets[ip] = [t for t in _rl_buckets[ip] if now - t < _RL_WINDOW_SEC]
+    if len(_rl_buckets[ip]) >= limit:
+        return False
+    _rl_buckets[ip].append(now)
+    return True
+
+
+# Allowed redirect_uri origins for OAuth (prevents redirect phishing)
+_ALLOWED_REDIRECT_HOSTS = {"claude.ai"}
+
+
+def _redirect_allowed(uri: str) -> bool:
+    """Accept claude.ai (and subdomains) or localhost for dev."""
+    p = urlparse(uri)
+    host = p.netloc.split(":")[0]
+    if p.scheme == "https" and (host == "claude.ai" or host.endswith(".claude.ai")):
+        return True
+    if host in ("localhost", "127.0.0.1"):
+        return True
+    return False
+
+
 # ── OAuth discovery ────────────────────────────────────────────────────────────
 
 async def _well_known_resource(scope: Scope):
@@ -103,6 +144,8 @@ async def _well_known_auth_server(scope: Scope):
 # ── OAuth endpoints ────────────────────────────────────────────────────────────
 
 async def _oauth_register(request: Request):
+    if not _rate_ok(_client_ip(request.scope), limit=10):
+        return JSONResponse({"error": "rate_limit_exceeded"}, status_code=429)
     body = {}
     try:
         body = await request.json()
@@ -120,11 +163,21 @@ async def _oauth_register(request: Request):
 
 
 async def _oauth_authorize(request: Request):
+    if not _rate_ok(_client_ip(request.scope), limit=20):
+        return JSONResponse({"error": "rate_limit_exceeded"}, status_code=429)
+
     if request.method == "GET":
         p = dict(request.query_params)
         redirect_uri   = p.get("redirect_uri", "")
         state          = p.get("state", "")
         code_challenge = p.get("code_challenge", "")
+
+        if not code_challenge:
+            return JSONResponse({"error": "invalid_request", "error_description": "code_challenge is required (PKCE S256)"}, status_code=400)
+        if not _redirect_allowed(redirect_uri):
+            log.warning(f"OAuth authorize: blocked redirect_uri={redirect_uri[:80]}")
+            return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not permitted"}, status_code=400)
+
         log.info(f"OAuth authorize GET, redirect={redirect_uri[:60]}")
         html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -156,7 +209,7 @@ async def _oauth_authorize(request: Request):
     redirect_uri   = form.get("redirect_uri", "")
     state          = form.get("state", "")
     code_challenge = form.get("code_challenge", "")
-    log.info(f"OAuth authorize POST, pat_prefix={pat[:8] if pat else 'EMPTY'}")
+    log.info(f"OAuth authorize POST, pat_present={bool(pat)}")
 
     if not pat:
         return HTMLResponse("<p>PAT is required.</p>", status_code=400)
@@ -168,6 +221,9 @@ async def _oauth_authorize(request: Request):
 
 
 async def _oauth_token(request: Request):
+    if not _rate_ok(_client_ip(request.scope), limit=10):
+        return JSONResponse({"error": "rate_limit_exceeded"}, status_code=429)
+
     code = code_verifier = ""
     try:
         form = await request.form()
@@ -179,18 +235,21 @@ async def _oauth_token(request: Request):
         except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    log.info(f"OAuth token exchange, code={code[:8] if code else 'EMPTY'}")
+    log.info(f"OAuth token exchange, code_present={bool(code)}")
     entry = _auth_codes.pop(code, None)
     if not entry or time.time() > entry["expires"]:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
-    if entry["code_challenge"]:
-        expected = base64.urlsafe_b64encode(
-            hashlib.sha256(code_verifier.encode()).digest()
-        ).rstrip(b"=").decode()
-        if expected != entry["code_challenge"]:
-            log.warning("PKCE verification failed")
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    # PKCE is always required — codes issued without code_challenge are rejected
+    if not entry["code_challenge"] or not code_verifier:
+        log.warning("PKCE missing on token exchange")
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    expected = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    if expected != entry["code_challenge"]:
+        log.warning("PKCE verification failed")
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     log.info("OAuth token issued successfully")
     return JSONResponse({"access_token": entry["token"], "token_type": "Bearer", "expires_in": 86400 * 30})
@@ -206,7 +265,7 @@ async def _handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
         return
 
     method = scope.get("method", "GET").upper()
-    log.info(f"MCP {method} /sse token={token[:8]}...")
+    log.info(f"MCP {method} /sse token_present=True")
     _token_var.set(token)
 
     if method == "POST" and _HAS_STREAMABLE:
