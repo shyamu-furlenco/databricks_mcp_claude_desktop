@@ -12,6 +12,7 @@ import time
 import hashlib
 import asyncio
 import logging
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 from databricks import sql as databricks_sql
@@ -34,8 +35,11 @@ def load_config() -> dict:
 CFG = load_config()
 
 DATABRICKS_HOST  = os.getenv("DATABRICKS_HOST",     CFG["databricks"]["host"])
-DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN",     CFG["databricks"]["token"])
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN",     CFG["databricks"]["token"])  # fallback for stdio/local mode
 HTTP_PATH        = os.getenv("DATABRICKS_HTTP_PATH", CFG["databricks"]["http_path"])
+
+# Per-connection token (set by SSE middleware for remote mode; falls back to DATABRICKS_TOKEN for stdio)
+_token_var: contextvars.ContextVar[str] = contextvars.ContextVar("databricks_token", default="")
 
 GUARDRAILS             = CFG["guardrails"]
 ALLOWED_CATALOGS       = set(GUARDRAILS.get("allowed_catalogs", []))
@@ -121,7 +125,8 @@ def truncate_result(rows: list[dict], max_bytes: int) -> tuple[list[dict], bool]
 _result_cache: dict = {}
 
 def _sql_cache_key(query: str) -> str:
-    return hashlib.md5(query.strip().lower().encode()).hexdigest()
+    token = _token_var.get() or DATABRICKS_TOKEN
+    return hashlib.md5(f"{token}:{query.strip().lower()}".encode()).hexdigest()
 
 def _cache_get(key: str):
     entry = _result_cache.get(key)
@@ -169,15 +174,23 @@ async def _run_sql_blocking(query: str):
     return result
 
 # ── Databricks connections ────────────────────────────────────────────────────
+def _active_token() -> str:
+    token = _token_var.get() or DATABRICKS_TOKEN
+    if not token:
+        raise PermissionError(
+            "No Databricks token. In Claude.ai, set your PAT as the connector Bearer token."
+        )
+    return token
+
 def get_sql_connection():
     return databricks_sql.connect(
         server_hostname=DATABRICKS_HOST,
         http_path=HTTP_PATH,
-        access_token=DATABRICKS_TOKEN,
+        access_token=_active_token(),
     )
 
 def get_workspace_client() -> WorkspaceClient:
-    return WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
+    return WorkspaceClient(host=DATABRICKS_HOST, token=_active_token())
 
 # ── MCP server setup ──────────────────────────────────────────────────────────
 app = Server("databricks-mcp")
