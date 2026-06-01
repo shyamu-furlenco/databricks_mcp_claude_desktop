@@ -18,6 +18,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 import uvicorn
 
+import logging
+log = logging.getLogger("databricks-mcp")
+
 from .server import app as mcp_app, _token_var
 
 # ── SSE transport ──────────────────────────────────────────────────────────────
@@ -31,14 +34,17 @@ async def handle_sse(request: Request):
         auth = request.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip()
     if not token:
+        log.warning("SSE connection rejected: no token provided")
         return JSONResponse(
             {"error": "Unauthorized: pass your Databricks PAT as ?token=<your-pat> in the URL"},
             status_code=401,
         )
+    log.info(f"SSE connection accepted, token prefix={token[:8]}...")
     # Bind token to this connection's async context — propagates into all tool calls
     _token_var.set(token)
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await mcp_app.run(streams[0], streams[1], mcp_app.create_initialization_options())
+    log.info("SSE connection closed")
 
 
 async def handle_messages(request: Request):
