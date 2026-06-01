@@ -178,7 +178,8 @@ def _active_token() -> str:
     token = _token_var.get() or DATABRICKS_TOKEN
     if not token:
         raise PermissionError(
-            "No Databricks token. In Claude.ai, set your PAT as the connector Bearer token."
+            "No Databricks PAT found. Re-add the connector in Claude.ai using the URL: "
+            "https://<your-server>.onrender.com/sse?token=<your-databricks-pat>"
         )
     return token
 
