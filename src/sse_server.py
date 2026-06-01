@@ -4,8 +4,9 @@ Remote SSE transport layer — wrap the stdio MCP server for HTTP hosting.
 Run from the databricks-mcp/ directory:
   uvicorn src.sse_server:app --host 0.0.0.0 --port 8000
 
-Each user sets their own Databricks PAT as the Bearer token in Claude.ai:
-  Authorization: Bearer dapi<user-personal-access-token>
+Each user passes their Databricks PAT in one of two ways:
+  1. URL query param (Claude.ai connector): .../sse?token=dapi...
+  2. Authorization header (programmatic):   Authorization: Bearer dapi...
 
 The server stores no token — each connection authenticates with the caller's PAT.
 """
@@ -24,11 +25,14 @@ sse = SseServerTransport("/messages/")
 
 
 async def handle_sse(request: Request):
-    auth = request.headers.get("Authorization", "")
-    token = auth.removeprefix("Bearer ").strip()
+    # Accept token from query param (Claude.ai UI) or Authorization header (programmatic)
+    token = request.query_params.get("token", "")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        token = auth.removeprefix("Bearer ").strip()
     if not token.startswith("dapi"):
         return JSONResponse(
-            {"error": "Unauthorized: provide your Databricks PAT as 'Authorization: Bearer dapi...'"},
+            {"error": "Unauthorized: pass your Databricks PAT as ?token=dapi... or Authorization: Bearer dapi..."},
             status_code=401,
         )
     # Bind token to this connection's async context — propagates into all tool calls
