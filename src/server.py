@@ -152,8 +152,16 @@ async def _run_sql_blocking(query: str):
         log.info(f"cache hit: {query[:80]!r}")
         return cached
 
+    # Capture token in async context before handing to thread pool — contextvar
+    # propagation through run_in_executor is unreliable across MCP SDK task boundaries.
+    access_token = _active_token()
+
     def _execute():
-        conn = get_sql_connection()
+        conn = databricks_sql.connect(
+            server_hostname=DATABRICKS_HOST,
+            http_path=HTTP_PATH,
+            access_token=access_token,
+        )
         try:
             with conn.cursor() as cur:
                 cur.execute(query)
@@ -176,6 +184,7 @@ async def _run_sql_blocking(query: str):
 # ── Databricks connections ────────────────────────────────────────────────────
 def _active_token() -> str:
     token = _token_var.get() or DATABRICKS_TOKEN
+    log.debug("_active_token: contextvar=%r global=%r found=%r", bool(_token_var.get()), bool(DATABRICKS_TOKEN), bool(token))
     if not token:
         raise PermissionError(
             "No Databricks PAT found. Re-add the connector in Claude.ai using the URL: "
@@ -265,8 +274,15 @@ async def tool_browse_catalog(args: dict) -> list[types.TextContent]:
         log.info(f"cache hit: browse_catalog level={level}")
         return [types.TextContent(type="text", text=json.dumps({"level": level, "items": cached_items}, indent=2))]
 
+    # Capture token in async context before handing to thread pool.
+    access_token = _active_token()
+
     def _browse():
-        conn = get_sql_connection()
+        conn = databricks_sql.connect(
+            server_hostname=DATABRICKS_HOST,
+            http_path=HTTP_PATH,
+            access_token=access_token,
+        )
         try:
             with conn.cursor() as cur:
                 if level == "catalogs":
@@ -372,7 +388,7 @@ async def tool_trigger_job(args: dict) -> list[types.TextContent]:
             f"Job {job_id} is not in the allowed jobs list: {allowed_jobs}"
         )
 
-    wc = get_workspace_client()
+    wc = WorkspaceClient(host=DATABRICKS_HOST, token=_active_token())
     run = wc.jobs.run_now(
         job_id=int(job_id),
         notebook_params=notebook_params or None,
