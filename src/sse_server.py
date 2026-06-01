@@ -16,9 +16,11 @@ Flow:
 
 import base64
 import hashlib
+import os
 import secrets
 import time
 import logging
+from html import escape
 from urllib.parse import urlencode
 
 from mcp.server.sse import SseServerTransport
@@ -37,17 +39,28 @@ sse = SseServerTransport("/messages/")
 _auth_codes: dict = {}
 
 
+def _base_url(scope: Scope) -> str:
+    """Return the public-facing base URL, respecting Render's TLS proxy headers."""
+    headers = dict(scope.get("headers", []))
+    # Render terminates TLS and forwards X-Forwarded-Proto: https
+    proto = headers.get(b"x-forwarded-proto", b"").decode() or "https"
+    host  = headers.get(b"host", b"localhost").decode()
+    return f"{proto}://{host}"
+
+
 # ── OAuth discovery ────────────────────────────────────────────────────────────
 
-async def _well_known_resource(request: Request):
-    base = str(request.base_url).rstrip("/")
+async def _well_known_resource(scope: Scope):
+    base = _base_url(scope)
+    log.info(f"OAuth resource metadata requested, base={base}")
     return JSONResponse({
         "resource": base,
         "authorization_servers": [base],
     })
 
-async def _well_known_auth_server(request: Request):
-    base = str(request.base_url).rstrip("/")
+async def _well_known_auth_server(scope: Scope):
+    base = _base_url(scope)
+    log.info(f"OAuth server metadata requested, base={base}")
     return JSONResponse({
         "issuer": base,
         "authorization_endpoint": f"{base}/oauth/authorize",
@@ -57,6 +70,7 @@ async def _well_known_auth_server(request: Request):
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["mcp"],
     })
 
 
@@ -69,9 +83,10 @@ async def _oauth_register(request: Request):
         body = await request.json()
     except Exception:
         pass
+    client_id = secrets.token_hex(8)
+    log.info(f"OAuth client registered: {client_id}")
     return JSONResponse({
-        "client_id": secrets.token_hex(8),
-        "client_secret": "",
+        "client_id": client_id,
         "redirect_uris": body.get("redirect_uris", []),
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
@@ -82,11 +97,13 @@ async def _oauth_register(request: Request):
 async def _oauth_authorize(request: Request):
     """Show a PAT entry form (GET) or process it and redirect with auth code (POST)."""
     if request.method == "GET":
-        params = dict(request.query_params)
+        params         = dict(request.query_params)
         redirect_uri   = params.get("redirect_uri", "")
         state          = params.get("state", "")
         code_challenge = params.get("code_challenge", "")
+        log.info(f"OAuth authorize GET redirect_uri={redirect_uri[:60]}")
 
+        # HTML-escape all values embedded in the form
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -112,12 +129,12 @@ async def _oauth_authorize(request: Request):
   <h2>Connect Claude.ai to Databricks</h2>
   <p>Enter your Databricks Personal Access Token (PAT) to authorise this connection.</p>
   <form method="POST">
-    <input type="hidden" name="redirect_uri"   value="{redirect_uri}">
-    <input type="hidden" name="state"          value="{state}">
-    <input type="hidden" name="code_challenge" value="{code_challenge}">
+    <input type="hidden" name="redirect_uri"   value="{escape(redirect_uri)}">
+    <input type="hidden" name="state"          value="{escape(state)}">
+    <input type="hidden" name="code_challenge" value="{escape(code_challenge)}">
     <input type="text" name="pat" placeholder="dapi..." autocomplete="off" required>
     <button type="submit">Authorise</button>
-    <small>Generate a PAT in Databricks → User Settings → Developer → Access Tokens</small>
+    <small>Generate a PAT: Databricks workspace → User Settings → Developer → Access Tokens</small>
   </form>
 </body>
 </html>"""
@@ -129,6 +146,7 @@ async def _oauth_authorize(request: Request):
     redirect_uri   = form.get("redirect_uri", "")
     state          = form.get("state", "")
     code_challenge = form.get("code_challenge", "")
+    log.info(f"OAuth authorize POST pat_prefix={pat[:8] if pat else 'EMPTY'}")
 
     if not pat:
         return HTMLResponse("<p>PAT is required.</p>", status_code=400)
@@ -140,18 +158,26 @@ async def _oauth_authorize(request: Request):
         "expires":        time.time() + 300,
     }
     qs = urlencode({"code": code, "state": state})
+    log.info(f"OAuth code issued, redirecting to {redirect_uri[:60]}")
     return RedirectResponse(f"{redirect_uri}?{qs}", status_code=302)
 
 
 async def _oauth_token(request: Request):
     """Exchange auth code for access token (the Databricks PAT)."""
+    code = code_verifier = ""
     try:
-        form = await request.form()
+        form          = await request.form()
+        code          = form.get("code", "")
+        code_verifier = form.get("code_verifier", "")
     except Exception:
-        return JSONResponse({"error": "invalid_request"}, status_code=400)
+        try:
+            body          = await request.json()
+            code          = body.get("code", "")
+            code_verifier = body.get("code_verifier", "")
+        except Exception:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    code          = form.get("code", "")
-    code_verifier = form.get("code_verifier", "")
+    log.info(f"OAuth token exchange for code={code[:8] if code else 'EMPTY'}")
 
     entry = _auth_codes.pop(code, None)
     if not entry or time.time() > entry["expires"]:
@@ -230,11 +256,9 @@ async def _dispatch(scope: Scope, receive: Receive, send: Send) -> None:
     if path == "/health":
         await _health(scope, receive, send)
     elif path == "/.well-known/oauth-protected-resource":
-        req = Request(scope, receive, send)
-        await (await _well_known_resource(req))(scope, receive, send)
+        await (await _well_known_resource(scope))(scope, receive, send)
     elif path == "/.well-known/oauth-authorization-server":
-        req = Request(scope, receive, send)
-        await (await _well_known_auth_server(req))(scope, receive, send)
+        await (await _well_known_auth_server(scope))(scope, receive, send)
     elif path == "/oauth/register":
         req = Request(scope, receive, send)
         await (await _oauth_register(req))(scope, receive, send)
