@@ -20,6 +20,7 @@ import base64
 import collections
 import hashlib
 import logging
+import os
 import secrets
 import time
 from html import escape
@@ -56,25 +57,27 @@ _http_sessions: dict = {}
 # In-memory auth-code store: {code: {token, code_challenge, expires}}
 _auth_codes: dict = {}
 
+# Set SERVER_BASE_URL env var on Render to prevent Host-header injection poisoning
+# the OAuth discovery metadata (/.well-known/oauth-authorization-server).
+# e.g.  SERVER_BASE_URL=https://your-service.onrender.com
+_SERVER_BASE_URL: str = os.getenv("SERVER_BASE_URL", "").rstrip("/")
+
 
 def _base_url(scope: Scope) -> str:
+    if _SERVER_BASE_URL:
+        return _SERVER_BASE_URL
+    # Fallback: derive from headers — only safe when Render strips the Host header
     headers = dict(scope.get("headers", []))
     proto = headers.get(b"x-forwarded-proto", b"").decode() or "https"
     host  = headers.get(b"host", b"localhost").decode()
+    log.warning("SERVER_BASE_URL env var not set — Host header used for OAuth base URL (spoofable)")
     return f"{proto}://{host}"
 
 
 def _extract_token(scope: Scope) -> str:
     headers = dict(scope.get("headers", []))
     auth = headers.get(b"authorization", b"").decode()
-    token = auth.removeprefix("Bearer ").strip()
-    if not token:
-        qs = scope.get("query_string", b"").decode()
-        for part in qs.split("&"):
-            if part.startswith("token="):
-                token = part[6:]
-                break
-    return token
+    return auth.removeprefix("Bearer ").strip()
 
 
 # ── Rate limiting (per IP, in-memory) ─────────────────────────────────────────
@@ -88,7 +91,8 @@ def _client_ip(scope: Scope) -> str:
     headers = dict(scope.get("headers", []))
     xff = headers.get(b"x-forwarded-for", b"").decode()
     if xff:
-        return xff.split(",")[0].strip()
+        # Use rightmost entry — appended by Render's trusted proxy, not spoofable by client
+        return xff.split(",")[-1].strip()
     client = scope.get("client")
     return client[0] if client else "unknown"
 
@@ -162,9 +166,21 @@ async def _oauth_register(request: Request):
     }, status_code=201)
 
 
+_SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
+
+
 async def _oauth_authorize(request: Request):
     if not _rate_ok(_client_ip(request.scope), limit=20):
         return JSONResponse({"error": "rate_limit_exceeded"}, status_code=429)
+
+    # Prune expired codes on every authorize call — prevents unbounded memory growth
+    now = time.time()
+    for k in [k for k, v in _auth_codes.items() if now > v["expires"]]:
+        del _auth_codes[k]
 
     if request.method == "GET":
         p = dict(request.query_params)
@@ -202,7 +218,7 @@ async def _oauth_authorize(request: Request):
   <button type="submit">Authorise</button>
   <small>Databricks workspace → User Settings → Developer → Access Tokens → Generate new token</small>
 </form></body></html>"""
-        return HTMLResponse(html)
+        return HTMLResponse(html, headers=_SECURITY_HEADERS)
 
     form           = await request.form()
     pat            = form.get("pat", "").strip()
@@ -210,6 +226,11 @@ async def _oauth_authorize(request: Request):
     state          = form.get("state", "")
     code_challenge = form.get("code_challenge", "")
     log.info(f"OAuth authorize POST, pat_present={bool(pat)}")
+
+    # Re-validate redirect_uri on POST — the hidden field value could be tampered
+    if not _redirect_allowed(redirect_uri):
+        log.warning(f"OAuth authorize POST: blocked redirect_uri={redirect_uri[:80]}")
+        return HTMLResponse("<p>Invalid redirect URI.</p>", status_code=400)
 
     if not pat:
         return HTMLResponse("<p>PAT is required.</p>", status_code=400)

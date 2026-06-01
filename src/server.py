@@ -60,6 +60,12 @@ def _quote_id(name: str) -> str:
     return f"`{name.replace('`', '')}`"
 
 
+def _strip_sql_quotes(sql: str) -> str:
+    """Remove backtick and double-quote identifier quoting before guardrail pattern checks.
+    Prevents bypass via e.g. `bronze_catalog`.schema."""
+    return re.sub(r'[`"]', '', sql)
+
+
 # ── Guardrail patterns ────────────────────────────────────────────────────────
 _WRITE_PATTERN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|CREATE|ALTER|MERGE|REPLACE|GRANT|REVOKE|COPY)\b",
@@ -79,7 +85,7 @@ def enforce_read_only(sql: str):
         raise PermissionError(f"Write operation '{m.group()}' is not allowed. This MCP is read-only.")
 
 def enforce_no_bronze(sql: str):
-    if BLOCK_BRONZE and _BRONZE_PATTERN.search(sql):
+    if BLOCK_BRONZE and _BRONZE_PATTERN.search(_strip_sql_quotes(sql)):
         raise PermissionError(
             "Bronze layer queries are not allowed. "
             "Ask the data team to create a Gold or Silver view for this data."
@@ -150,6 +156,14 @@ def _cache_set(key: str, result) -> None:
 # ── Async executor + concurrency cap ─────────────────────────────────────────
 _executor = ThreadPoolExecutor(max_workers=4)
 _query_semaphore = asyncio.Semaphore(MAX_CONCURRENT_QUERIES)
+_user_semaphores: dict = {}  # per-user slot (1 concurrent query each) prevents monopolising all global slots
+
+
+def _user_sem(token: str) -> asyncio.Semaphore:
+    key = hashlib.md5(token.encode()).hexdigest()
+    if key not in _user_semaphores:
+        _user_semaphores[key] = asyncio.Semaphore(1)
+    return _user_semaphores[key]
 
 async def _run_sql_blocking(query: str):
     """Run a synchronous SQL query in a thread with timeout and concurrency enforcement."""
@@ -178,7 +192,7 @@ async def _run_sql_blocking(query: str):
         finally:
             conn.close()
 
-    async with _query_semaphore:
+    async with _user_sem(access_token), _query_semaphore:
         loop = asyncio.get_running_loop()
         result = await asyncio.wait_for(
             loop.run_in_executor(_executor, _execute),
@@ -325,7 +339,7 @@ async def tool_browse_catalog(args: dict) -> list[types.TextContent]:
         finally:
             conn.close()
 
-    async with _query_semaphore:
+    async with _user_sem(access_token), _query_semaphore:
         loop = asyncio.get_running_loop()
         try:
             items = await asyncio.wait_for(
@@ -391,7 +405,9 @@ async def tool_trigger_job(args: dict) -> list[types.TextContent]:
         raise ValueError("'job_id' is required.")
 
     allowed_jobs = GUARDRAILS.get("allowed_job_ids", [])
-    if allowed_jobs and int(job_id) not in [int(j) for j in allowed_jobs]:
+    if not allowed_jobs:
+        log.warning("trigger_job: allowed_job_ids is empty — ALL jobs are allowed; add job IDs to config/settings.json to restrict")
+    elif int(job_id) not in [int(j) for j in allowed_jobs]:
         raise PermissionError(
             f"Job {job_id} is not in the allowed jobs list: {allowed_jobs}"
         )
