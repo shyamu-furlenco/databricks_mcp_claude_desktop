@@ -30,9 +30,9 @@ async def handle_sse(request: Request):
     if not token:
         auth = request.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip()
-    if not token.startswith("dapi"):
+    if not token:
         return JSONResponse(
-            {"error": "Unauthorized: pass your Databricks PAT as ?token=dapi... or Authorization: Bearer dapi..."},
+            {"error": "Unauthorized: pass your Databricks PAT as ?token=<your-pat> in the URL"},
             status_code=401,
         )
     # Bind token to this connection's async context — propagates into all tool calls
